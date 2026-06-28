@@ -1,0 +1,326 @@
+# Z-Score 异常检测算法 · 代码详解
+
+> 涉及文件：
+> - `controller/StatsController.java`（接口层）
+> - `service/StatsService.java`（接口定义层）
+> - `service/impl/StatsServiceImpl.java`（实现层 · 算法核心在 `detectAnomalies`）
+
+---
+
+## 一、这个功能在干嘛
+
+用统计学的**标准分（Z-Score）**判断"最近一天的正确率"相对"用户自己的历史水平"是不是反常。
+
+它问的核心问题是：**"今天的成绩，对你自己来说算不算反常？"** 不是"高不高"，而是"反不反常"。所以它衡量的是**相对你自己**的波动，而不是绝对分数——一个学霸从 95% 掉到 80% 会被预警，而一个一直考 60% 的人考 60% 则算正常。
+
+公式：
+
+```
+Z = (最近一天的正确率 − 历史平均) / 历史标准差
+```
+
+- `Z` 表示偏离了几个标准差。
+- `Z < -1.5` → 异常下滑，预警"建议重点复习"。
+- `Z > 1.5` → 明显进步，提示"继续保持"。
+- 中间 → 正常波动。
+
+可以画成"正常区间"来理解：在历史平均线上下，按 `平均 ± 1.5×标准差` 画一条"你的正常区间"。今天落在区间里=正常，掉到区间下方=异常，冲到区间上方=优秀。Z 值就是"今天离平均，差了几个标准差"。
+
+---
+
+## 二、调用链路
+
+```
+前端图表请求
+   │
+   ▼
+StatsController           ← 接收请求，包装统一响应 Result
+   │  调用
+   ▼
+StatsService（接口）       ← 声明能力
+   │  实现
+   ▼
+StatsServiceImpl          ← 纯内存计算：分组→算正确率→算 Z→判定
+   │  访问
+   ▼
+UserAnswerMapper / QuestionMapper / …   ← 取答题记录、题目
+```
+
+对外接口（路由前缀 `/stats`）：
+
+| 方法 | URL | 作用 |
+|------|-----|------|
+| `GET` | `/stats/overview/{userId}` | 学习概览（总题数、正确率、待复习、连续天数、错题数） |
+| `GET` | `/stats/subject-accuracy/{userId}` | 各学科正确率（柱状图用） |
+| `GET` | `/stats/wordcloud/{userId}` | 知识点词云（词频） |
+| `GET` | `/stats/anomaly/{userId}` | **Z-Score 异常检测** |
+
+本文聚焦最后一个 `detectAnomalies`。
+
+---
+
+## 三、Controller 层详解（StatsController）
+
+统计接口都很"薄"——接参数、调服务、返回。没有业务逻辑。
+
+```java
+@RestController
+@RequestMapping("/stats")
+@Tag(name = "学习统计接口")
+public class StatsController {
+
+    @Autowired
+    private StatsService statsService;
+
+    @Operation(summary = "学习异常检测", description = "基于Z-Score算法检测各学科正确率是否异常下降")
+    @GetMapping("/anomaly/{userId}")
+    public Result<List<Map<String, Object>>> detectAnomalies(@PathVariable Integer userId) {
+        return Result.success(statsService.detectAnomalies(userId));
+    }
+}
+```
+
+- `@GetMapping("/anomaly/{userId}")`：映射 `GET /stats/anomaly/{userId}`。
+- `@PathVariable Integer userId`：取出 URL 路径里的用户 id。
+- 返回类型 `Result<List<Map<String, Object>>>`：包一层统一响应，里面是"一串结果，每个结果是一组键值对"。
+- 控制器一行就把活儿全交给 `statsService.detectAnomalies(userId)`，自己只负责包结果。
+
+### 关于返回类型 `List<Map<String, Object>>`
+
+从里往外读：
+
+- 最里层 `Map<String, Object>` = **一个学科的检测结果**。键是字段名（字符串），值用 `Object` 是因为一个 Map 里要装不同类型（学科 id 是数字、学科名是字符串、Z 值是小数、状态是字符串），`Object` 能装下任何类型。
+- 外层 `List<...>` = **多个学科**串成的列表（一个用户可能学多科，每科一条结果）。
+
+返回给前端长这样：
+
+```json
+[
+  { "subjectName": "高等数学",   "status": "abnormal",  "zScore": -8.58 },
+  { "subjectName": "数据结构",   "status": "normal",    "zScore": -0.3 },
+  { "subjectName": "计算机网络", "status": "excellent", "zScore": 2.1 }
+]
+```
+
+> 可优化：用 `Map<String, Object>` 是图省事的写法，光看签名不知道有哪些字段。更规范可定义一个 `AnomalyResult` 类返回 `List<AnomalyResult>`，类型安全、字段清晰。
+
+---
+
+## 四、Service 接口层详解（StatsService）
+
+只声明能力，不写实现。
+
+```java
+public interface StatsService {
+    Map<String, Object> getOverview(Integer userId);             // 学习概览
+    List<Map<String, Object>> getSubjectAccuracy(Integer userId);// 各学科正确率
+    List<Map<String, Object>> getWordCloud(Integer userId);      // 知识点词云
+    List<Map<String, Object>> detectAnomalies(Integer userId);   // 正确率异常检测
+}
+```
+
+`StatsServiceImpl` 负责把这四个方法实现出来。
+
+---
+
+## 五、Impl 层详解（detectAnomalies · 算法核心）
+
+整段就在按顺序做四件事，用一组示例数据贯穿讲解：某用户在**高数**答了 4 天，正确率 80 → 90 → 85 → 50。
+
+### 开头：取数据 + 样本门槛
+
+```java
+List<UserAnswer> allAnswers = userAnswerMapper.selectList(
+        new LambdaQueryWrapper<UserAnswer>()
+                .eq(UserAnswer::getUserId, userId)
+                .orderByAsc(UserAnswer::getCreateTime));   // 按时间升序（后面要按天切分）
+if (allAnswers.size() < 5) {
+    return new ArrayList<>();                              // 样本太少，返回空
+}
+```
+
+- 查出该用户**全部**答题记录，**按时间从早到晚**排（顺序很重要，后面靠"列表最后一个=最近一天"）。
+- 总记录不到 5 条直接返回空——数据太少算统计没意义。
+
+接着建一张"题目 id → 学科 id"的速查表（答题记录里只有 `questionId`，得知道每题属于哪个学科）：
+
+```java
+Set<Integer> questionIds = allAnswers.stream()             // 开启流水线
+        .map(UserAnswer::getQuestionId)                   // 每条记录 → 它的题目 id
+        .collect(Collectors.toSet());                     // 收集成 Set（自动去重）
+List<Question> questions = questionMapper.selectBatchIds(questionIds);  // 按一堆 id 一次查出所有题目
+Map<Integer, Integer> qToSubject = questions.stream()
+        .collect(Collectors.toMap(
+                Question::getId,           // 键 = 题目 id
+                Question::getSubjectId,    // 值 = 学科 id
+                (a, b) -> a));             // 键冲突时留前一个（安全兜底）
+```
+
+> Stream 提示：`stream()` 开流水线，`map()` 把每个东西转换成另一个，`collect()` 把结果装起来。本质都是 for 循环的简写。
+
+### 第一步：按"学科-日期"统计每天对错
+
+```java
+Map<String, int[]> dailyStats = new LinkedHashMap<>();    // 键=字符串，值=小数组
+for (UserAnswer a : allAnswers) {
+    Integer subjectId = qToSubject.get(a.getQuestionId());// 查这题的学科
+    if (subjectId == null) continue;                      // 题被删了，跳过
+    String key = subjectId + "-" + a.getCreateTime().toLocalDate();  // 堆名，如 "1-2024-06-01"
+    dailyStats.computeIfAbsent(key, k -> new int[]{0, 0, subjectId}); // 这堆没有就新建 [0,0,学科]
+    dailyStats.get(key)[0]++;                             // 这堆总数 +1
+    if (a.getIsCorrect() == 1) dailyStats.get(key)[1]++;  // 这堆对的数 +1
+}
+```
+
+把答题记录**按"哪个学科、哪一天"分堆**，每堆数两个数：一共几张、对了几张。
+
+- `key` = `学科id-日期`，同一学科同一天的记录名字一样，进同一堆。
+- `.toLocalDate()`：把"年月日时分秒"只留**日期**（扔掉时分秒），同一天才能归到一起。
+- `int[]{0, 0, subjectId}`：三格小盒子 `[总数, 对的数, 学科号]`。`[0]++` 是第 0 格加一。
+- `computeIfAbsent(key, ...)`：这堆第一次出现就新建，已存在就用现成的——一行代码替代"if 判断存在就初始化"。
+- 用 `LinkedHashMap` 而非普通 HashMap，是因为它**保留插入顺序**（前面记录按时间排好，这里也按时间存）。
+
+跑完 `dailyStats`：
+
+```
+"1-1号" → [10, 8, 1]
+"1-2号" → [10, 9, 1]
+"1-3号" → [10, 8, 1]
+"1-4号" → [10, 5, 1]
+```
+
+### 第二步：换算成每天正确率，按学科归集
+
+```java
+Map<Integer, List<double[]>> subjectDailyAccuracy = new HashMap<>();  // 学科 → 一串正确率
+for (Map.Entry<String, int[]> entry : dailyStats.entrySet()) {       // 遍历每一对键值
+    int[] stats = entry.getValue();                       // 取出 [总数,对数,学科]
+    int subjectId = stats[2];                             // 第 2 格 = 学科号
+    double accuracy = stats[0] > 0 ? (stats[1] * 100.0 / stats[0]) : 0;  // 总数>0就算正确率，否则0
+    subjectDailyAccuracy.computeIfAbsent(subjectId, k -> new ArrayList<>());
+    subjectDailyAccuracy.get(subjectId).add(new double[]{accuracy});    // 追加当天正确率
+}
+```
+
+- `stats[1] * 100.0 / stats[0]` = 对的数 ÷ 总数 × 100。
+- `100.0` 必须带小数点！否则两个整数相除会砍掉小数（`8/10` 直接等于 0），带 `.0` 强制浮点除法。
+- `stats[0] > 0 ? ... : 0` 是三元表达式，防止除以 0。
+
+跑完 `subjectDailyAccuracy`：
+
+```
+学科1（高数） → [80, 90, 85, 50]   ← 按时间排的一串每日正确率
+```
+
+### 第三步：算 Z-Score 并判定（核心）
+
+```java
+for (Map.Entry<Integer, List<double[]>> entry : subjectDailyAccuracy.entrySet()) {
+    Integer subjectId = entry.getKey();
+    List<double[]> dailyRates = entry.getValue();         // 这串正确率 [80,90,85,50]
+    if (dailyRates.size() < 3) continue;                  // 至少 3 天才能"历史对比最近"
+
+    double latestRate = dailyRates.get(dailyRates.size() - 1)[0];  // 最后一个=今天=50
+    List<double[]> history = dailyRates.subList(0, dailyRates.size() - 1);  // 历史=[80,90,85]
+```
+
+- `get(size - 1)`：取最后一个（最近一天）。一串数有 4 个，下标 0~3，最后一个下标是 `4-1=3`。
+- `subList(0, size - 1)`：截取子列表（0 到 size-1，不含最后一个）= 除最近那天外的所有历史。
+
+```java
+    double mean = history.stream().mapToDouble(d -> d[0]).average().orElse(0);  // 历史均值
+```
+
+求历史均值：`mapToDouble` 把每个转成数字流，`average` 求平均，`orElse(0)` 空了给 0。
+
+> 均值 = (80+90+85)/3 = **85**
+
+```java
+    double variance = history.stream().mapToDouble(d -> Math.pow(d[0] - mean, 2)).average().orElse(0);  // 方差
+    double stdDev = Math.sqrt(variance);                  // 标准差 = 方差开方
+    if (stdDev < 1) stdDev = 1;                           // 兜底：太小强行当 1
+```
+
+- `Math.pow(x, 2)` = x 的平方；`Math.sqrt(x)` = 开平方根。都是 Java 自带数学工具 `Math`。
+- 方差 = 每个值减均值、平方、再求平均 = [(80-85)²+(90-85)²+(85-85)²]/3 = (25+25+0)/3 ≈ **16.67**
+- 标准差 = √16.67 ≈ **4.08**（这就是"波动幅度"，表示历史数据自己波动多大）。
+- `if (stdDev < 1) stdDev = 1;` 是**关键保险丝**：标准差马上要当除数，若历史几乎不波动（标准差趋近 0），除以极小数会让 Z 爆炸失真（差 1% 都可能算出 Z=50）。强制下限 1 防止这种情况。
+
+```java
+    double zScore = (latestRate - mean) / stdDev;         // 核心公式
+```
+
+> Z = (50 − 85) / 4.08 ≈ **−8.58**。含义：今天比历史平均**低了 8.58 个标准差**，负得离谱。
+
+```java
+    Map<String, Object> item = new HashMap<>();
+    item.put("subjectId", subjectId);
+    item.put("subjectName", SUBJECT_NAMES.getOrDefault(subjectId, "未知"));   // 查学科名，查不到给"未知"
+    item.put("latestAccuracy", Math.round(latestRate * 10) / 10.0);          // 保留 1 位小数
+    item.put("zScore", Math.round(zScore * 100) / 100.0);                    // 保留 2 位小数
+    // …（还记了 historyAverage、stdDev，同理）
+
+    if (zScore < -1.5) {                                  // 太低 → 报警
+        item.put("status", "abnormal");
+        item.put("message", … + "正确率异常下降！… 建议重点复习");
+    } else if (zScore > 1.5) {                            // 太高 → 表扬
+        item.put("status", "excellent");
+        item.put("message", … + "正确率明显提升！… 继续保持");
+    } else {                                              // 中间 → 正常
+        item.put("status", "normal");
+        item.put("message", "正常范围");
+    }
+    anomalies.add(item);                                  // 存进总列表
+}
+```
+
+- `Math.round(x * 10) / 10.0` 是**保留小数技巧**：乘 10 → 四舍五入成整数 → 再除以 10.0。比如 `Math.round(85.37*10)/10.0 = 85.4`。乘 100 除 100.0 就是保留两位。
+- 判定：−8.58 < −1.5 → 落进第一档 → **abnormal**，文案"正确率异常下降"。
+- 若最近是 95%，Z=(95−85)/4.08≈+2.45>1.5 → excellent；若是 83%，Z≈−0.49 在 ±1.5 间 → normal。
+- `SUBJECT_NAMES` 是写死在类里的"学科 id → 学科名"映射（小项目省一次连表查询）。
+
+### 结尾：排序返回
+
+```java
+anomalies.sort((a, b) -> Double.compare((double) a.get("zScore"), (double) b.get("zScore")));
+return anomalies;
+```
+
+- `sort((a, b) -> ...)`：排序，括号里的 lambda 告诉它"两个元素怎么比大小"。
+- `Double.compare(...)` 比两个 Z 值，**升序**（小的在前）。
+- `(double) a.get("zScore")`：`get` 返回 Object，`(double)` 强制转回 double 才能比较。
+- 因为最异常的 Z 最负，升序让**最该补的学科排最前面**，方便前端突出展示。
+
+---
+
+## 六、整条数据流回顾
+
+```
+答题记录（按时间）
+  → 第一步：按"学科-日期"数对错 → 每天 [总数, 对的数]
+  → 第二步：换算正确率 → 每学科一串 [80, 90, 85, 50]
+  → 第三步：切最近 vs 历史，算 Z = (最近 − 均值) / 标准差
+  → 阈值判定：< -1.5 报警 / > 1.5 表扬 / 中间正常
+  → 按 Z 升序，最异常排最前
+```
+
+没有任何魔法，全是数数、算除法、比大小。
+
+---
+
+## 七、关键设计点与可优化项
+
+**三个保护性判断（都为避免"数据太少/太稳"时算出离谱结果）：**
+
+1. 总记录 `< 5` 不算。
+2. 单学科 `< 3` 天跳过（要"历史对比最近"，至少需 1 天最近 + 2 天历史）。
+3. 标准差 `< 1` 兜底成 1（防止除以接近 0 的数让 Z 爆炸）。
+
+**为什么用 Z-Score 而不是直接看分数？** 因为它比的是"**相对你自己**"。学霸从 95 掉到 80 会预警，一直考 60 的人考 60 算正常——绝对分数做不到这种个性化。这正是公式要除以标准差的意义：让"反常"是相对你自己的波动幅度。
+
+**±1.5 是经验阈值**，不是严格统计标准（教科书常用 ±2 或 ±3）。用 1.5 是想更灵敏地提醒学生，属于产品取舍，可调——调大就更宽容、报警更少。
+
+**可优化项：**
+
+- 返回类型用 `Map<String, Object>`，建议改成专门的 VO 类（如 `AnomalyResult`）提升可读性与类型安全。
+- "最近一天"只取序列最后一项，若某天答题极少（如只做 1 题），那天正确率会是 0% 或 100%，可能误判。可对"最近一天"的样本量也设门槛。
